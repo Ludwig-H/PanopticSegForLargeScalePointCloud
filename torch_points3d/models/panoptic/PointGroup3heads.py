@@ -16,6 +16,7 @@ from .structure_3heads import PanopticLabels, PanopticResults
 from torch_points3d.utils import hdbscan_cluster, meanshift_cluster
 from torch_points3d.utils import is_list
 from torch_points3d.utils import hdbscan_cluster
+from torch_points3d.utils.custom_cluster import resolve_custom_clusterer
 
 
 class PointGroup3heads(BaseModel):
@@ -84,6 +85,7 @@ class PointGroup3heads(BaseModel):
         if is_list(stuff_classes):
             stuff_classes = torch.Tensor(stuff_classes).long()
         self._stuff_classes = torch.cat([torch.tensor([IGNORE_LABEL]), stuff_classes])
+        self.custom_clusterer = resolve_custom_clusterer(option.get("custom_clustering", None))
 
     def get_opt_mergeTh(self):
         """returns configuration"""
@@ -112,9 +114,17 @@ class PointGroup3heads(BaseModel):
         mask_scores = None
         all_clusters = None # list of clusters (point idx)
         cluster_type = None # 0 for cluster, 1 for vote
+        cluster_choice = getattr(self.opt, "cluster_type", None)
+        custom_cluster = (
+            isinstance(cluster_choice, str) and cluster_choice.lower() == "custom"
+        ) or cluster_choice == 7
         if self.use_score_net: # and epoch > self.opt.prepare_epoch:
             if epoch > self.opt.prepare_epoch:   # Active by default epoch > -1: #
-                if self.opt.cluster_type == 1:
+                if custom_cluster:
+                    all_clusters, cluster_type = self._cluster_custom(
+                        semantic_logits, offset_logits, embed_logits, epoch
+                    )
+                elif self.opt.cluster_type == 1:
                     all_clusters, cluster_type = self._cluster(semantic_logits, offset_logits)
                 elif self.opt.cluster_type == 2:
                     all_clusters, cluster_type = self._cluster2(semantic_logits, offset_logits)
@@ -133,7 +143,11 @@ class PointGroup3heads(BaseModel):
         else:
             with torch.no_grad():
                 if epoch % 1 == 0:
-                    if self.opt.cluster_type == 1:
+                    if custom_cluster:
+                        all_clusters, cluster_type = self._cluster_custom(
+                            semantic_logits, offset_logits, embed_logits, epoch
+                        )
+                    elif self.opt.cluster_type == 1:
                         all_clusters, cluster_type = self._cluster(semantic_logits, offset_logits)
                     elif self.opt.cluster_type == 2:
                         all_clusters, cluster_type = self._cluster2(semantic_logits, offset_logits)
@@ -178,6 +192,57 @@ class PointGroup3heads(BaseModel):
         all_clusters = [c.to(self.device) for c in all_clusters]
         cluster_type = torch.zeros(len(all_clusters), dtype=torch.uint8).to(self.device)
         return all_clusters, cluster_type
+
+    def _cluster_custom(self, semantic_logits, offset_logits, embed_logits, epoch=-1):
+        if self.custom_clusterer is None:
+            raise ValueError(
+                "A custom clustering strategy was requested but no plugin was configured. "
+                "Set models.PointGroup-PAPER.custom_clustering to the plugin path when using "
+                "cluster_type=custom."
+            )
+
+        predicted_labels = torch.max(semantic_logits, 1)[1]
+        ignore_labels = self._stuff_classes.to(self.device)
+        mask = torch.ones(predicted_labels.shape[0], dtype=torch.bool, device=self.device)
+        for label in ignore_labels:
+            mask = mask & (predicted_labels != label)
+
+        if mask.sum() == 0:
+            empty_type = torch.empty(0, dtype=torch.uint8, device=self.device)
+            return [], empty_type
+
+        local_ind = torch.arange(predicted_labels.shape[0], device=self.device, dtype=torch.long)[mask]
+        label_batch = self.input.batch[mask]
+        embeddings = embed_logits[mask]
+        offsets = offset_logits[mask]
+        semantic_masked = semantic_logits[mask]
+        predicted_masked = predicted_labels[mask]
+        positions = self.raw_pos[mask]
+
+        metadata = {
+            "epoch": epoch,
+            "requested_cluster_type": getattr(self.opt, "cluster_type", None),
+        }
+
+        all_clusters, cluster_type = self.custom_clusterer(
+            embeddings=embeddings,
+            batch_ids=label_batch,
+            global_indices=local_ind,
+            predicted_labels=predicted_masked,
+            semantic_logits=semantic_masked,
+            positions=positions,
+            offsets=offsets,
+            raw_positions=self.raw_pos,
+            raw_embeddings=embed_logits,
+            raw_offsets=offset_logits,
+            raw_semantic_logits=semantic_logits,
+            raw_batch_ids=self.input.batch,
+            ignore_labels=ignore_labels,
+            bandwidth=getattr(self.opt, "bandwidth", None),
+            metadata=metadata,
+        )
+
+        return list(all_clusters), cluster_type
     
     def _cluster2(self, semantic_logits, offset_logits):
         """ Compute clusters from positions and votes """
